@@ -18,10 +18,9 @@ import tempfile
 import shutil
 import ctypes
 import ctypes.wintypes
-import time
 import threading
 
-FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe")
+FFMPEG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ffmpeg.exe")
 
 
 class CancelError(Exception):
@@ -58,13 +57,9 @@ class VideoCutter:
         # 当前显示的图像
         self.photo = None
 
-        # 预处理状态（后台提取音频 + 扫描关键帧）
-        self._pre_audio_done = threading.Event()
-        self._pre_kf_done = threading.Event()
-        self._pre_audio_path = None
-        self._pre_keyframes = None
-        self._pre_temp_dir = None
-        self._pre_video_path = None
+        # 关键帧吸附后的实际裁剪时间
+        self.mark_in_time = None
+        self.mark_out_time = None
 
         self.setup_ui()
         self._enable_drag_drop()
@@ -77,8 +72,6 @@ class VideoCutter:
                 p.kill()
             except Exception:
                 pass
-        if self._pre_temp_dir:
-            shutil.rmtree(self._pre_temp_dir, ignore_errors=True)
         self.root.destroy()
 
     # ── 界面搭建 ──────────────────────────────────────────────
@@ -257,12 +250,9 @@ class VideoCutter:
         self.step_fwd_btn.configure(state=tk.DISABLED)
         self.mark_in_btn.configure(state=tk.DISABLED)
         self.mark_out_btn.configure(state=tk.DISABLED)
+        self.mark_in_time = None
+        self.mark_out_time = None
         self.status_var.set("就绪")
-        # 清理预处理
-        self._pre_audio_done.set()
-        self._pre_kf_done.set()
-        self._pre_audio_path = None
-        self._pre_keyframes = None
 
     # ── 播放控制 ──────────────────────────────────────────────
 
@@ -408,20 +398,24 @@ class VideoCutter:
     def mark_in(self):
         if self.cap is None:
             return
-        self.mark_in_frame = self.current_frame
-        t = self.current_frame / self.fps
-        self.mark_in_lbl.configure(text=f"起点: {self._fmt(t)}")
-        self.status_var.set(f"标记起点: {self._fmt(t)} (帧 {self.current_frame})")
+        raw_t = self.current_frame / self.fps
+        snapped = self._snap_keyframe(raw_t, 'backward')
+        self.mark_in_time = snapped
+        self.mark_in_frame = int(snapped * self.fps)
+        self.mark_in_lbl.configure(text=f"起点: {self._fmt(snapped)}")
+        self.status_var.set(f"标记起点: {self._fmt(snapped)} (帧 {self.mark_in_frame})")
         self._update_progress_canvas()
         self._show_cut_ready()
 
     def mark_out(self):
         if self.cap is None:
             return
-        self.mark_out_frame = self.current_frame
-        t = self.current_frame / self.fps
-        self.mark_out_lbl.configure(text=f"终点: {self._fmt(t)}")
-        self.status_var.set(f"标记终点: {self._fmt(t)} (帧 {self.current_frame})")
+        raw_t = self.current_frame / self.fps
+        snapped = self._snap_keyframe(raw_t, 'forward')
+        self.mark_out_time = snapped
+        self.mark_out_frame = int(snapped * self.fps)
+        self.mark_out_lbl.configure(text=f"终点: {self._fmt(snapped)}")
+        self.status_var.set(f"标记终点: {self._fmt(snapped)} (帧 {self.mark_out_frame})")
         self._update_progress_canvas()
         self._show_cut_ready()
 
@@ -434,106 +428,49 @@ class VideoCutter:
         elif self.mark_in_frame is not None or self.mark_out_frame is not None:
             self.status_var.set("只设了单个标记，未设端将自动取视频头/尾")
 
-    # ── 关键帧检测 ──────────────────────────────────────────
+    # ── 关键帧吸附 ──────────────────────────────────────────
 
-    def _find_keyframes(self, video_path):
-        """返回视频所有关键帧的时间戳（秒）"""
-        kfs = set()
+    def _snap_keyframe(self, target_sec, direction):
+        """在目标时间附近搜索最近关键帧，direction: 'backward' | 'forward'
+        返回 snapped 后的时间（秒），搜索失败则返回原始值"""
+        margin = 30.0  # 搜索窗口 ±30 秒
+        if direction == 'backward':
+            seek_start = max(0, target_sec - margin)
+            search_dur = min(margin, target_sec) + 1
+        else:
+            seek_start = max(0, target_sec - 2)  # 略早开始，确保能搜到之后的
+            search_dur = margin + 2
+
         try:
-            cmd = [FFMPEG_PATH, "-i", video_path, "-vf", "showinfo", "-f", "null", "-"]
-            r = subprocess.run(cmd, capture_output=True, timeout=120,
-                              creationflags=subprocess.CREATE_NO_WINDOW)
-            stderr = r.stderr.decode('utf-8', errors='replace')
-            for line in stderr.splitlines():
-                if "key:1" in line and "pts_time:" in line:
+            cmd = [FFMPEG_PATH, "-y", "-ss", f"{seek_start:.3f}",
+                   "-i", self.video_path, "-t", f"{search_dur:.3f}",
+                   "-skip_frame", "nokey", "-vf", "showinfo", "-f", "null", "-"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   creationflags=subprocess.CREATE_NO_WINDOW,
+                                   universal_newlines=True, errors='replace')
+            self._running_procs.append(proc)
+            kfs = []
+            for line in proc.stderr:
+                if 'pts_time:' in line:
                     m = re.search(r'pts_time:([\d.]+)', line)
                     if m:
-                        kfs.add(round(float(m.group(1)), 3))
-        except Exception:
-            pass
-        return sorted(kfs)
-
-    # ── 后台预处理 ────────────────────────────────────────────
-
-    def _start_preprocessing(self, video_path):
-        """打开视频后启动后台预处理"""
-        self._pre_video_path = video_path
-        self._pre_audio_done.clear()
-        self._pre_kf_done.clear()
-        self._pre_audio_path = None
-        self._pre_keyframes = None
-        self._pre_audio_progress = 0.0
-        self._pre_kf_progress = 0.0
-        # 清理旧临时目录
-        if self._pre_temp_dir:
-            shutil.rmtree(self._pre_temp_dir, ignore_errors=True)
-        self._pre_temp_dir = tempfile.mkdtemp()
-        threading.Thread(target=self._pre_audio_worker, args=(video_path,), daemon=True).start()
-        threading.Thread(target=self._pre_keyframes_worker, args=(video_path,), daemon=True).start()
-
-    def _pre_audio_worker(self, video_path):
-        """后台：提取完整音频流，同步更新进度"""
-        try:
-            audio_path = os.path.join(self._pre_temp_dir, 'audio_full.m4a').replace('\\', '/')
-            proc = subprocess.Popen(
-                [FFMPEG_PATH, '-y', '-i', video_path, '-vn', '-c:a', 'aac', '-b:a', '64k', audio_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                universal_newlines=True, errors='replace'
-            )
-            self._running_procs.append(proc)
-            dur = self.duration
-            for line in iter(proc.stderr.readline, ''):
-                if video_path != self._pre_video_path:
-                    proc.kill()
-                    break
-                if dur > 0 and 'time=' in line:
-                    m = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
-                    if m:
-                        elapsed = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                        self._pre_audio_progress = min(elapsed / dur, 0.99)
+                        kfs.append(round(float(m.group(1)), 3))
             proc.wait()
             self._running_procs.remove(proc)
-            if proc.returncode == 0 and video_path == self._pre_video_path:
-                self._pre_audio_path = audio_path
-        except Exception:
-            pass
-        finally:
-            self._pre_audio_done.set()
 
-    def _pre_keyframes_worker(self, video_path):
-        """后台：扫描关键帧，同步更新进度"""
-        kfs = set()
-        try:
-            proc = subprocess.Popen(
-                [FFMPEG_PATH, '-i', video_path, '-vf', 'showinfo', '-f', 'null', '-'],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                universal_newlines=True, errors='replace'
-            )
-            self._running_procs.append(proc)
-            dur = self.duration
-            for line in iter(proc.stderr.readline, ''):
-                if video_path != self._pre_video_path:
-                    proc.kill()
-                    break
-                if 'key:1' in line and 'pts_time:' in line:
-                    m = re.search(r'pts_time:([\d.]+)', line)
-                    if m:
-                        kfs.add(round(float(m.group(1)), 3))
-                if dur > 0 and 'time=' in line:
-                    m = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
-                    if m:
-                        elapsed = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                        self._pre_kf_progress = min(elapsed / dur, 0.99)
-            proc.wait()
-            self._running_procs.remove(proc)
-            if proc.returncode == 0 and video_path == self._pre_video_path:
-                self._pre_keyframes = sorted(kfs)
+            # pts_time 相对于 seek 起点，绝对时间 = seek_start + pts_time
+            abs_kfs = [seek_start + t for t in kfs]
+            if not abs_kfs:
+                return target_sec
+
+            if direction == 'backward':
+                candidates = [t for t in abs_kfs if t <= target_sec]
+                return max(candidates) if candidates else abs_kfs[0]
+            else:
+                candidates = [t for t in abs_kfs if t >= target_sec]
+                return min(candidates) if candidates else abs_kfs[-1]
         except Exception:
-            pass
-        finally:
-            self._pre_kf_done.set()
+            return target_sec
 
     # ── 裁剪 ──────────────────────────────────────────────────
 
@@ -550,17 +487,20 @@ class VideoCutter:
         self.is_playing = False
         self.play_btn.configure(text="▶")
 
-        in_sec = (self.mark_in_frame / self.fps) if self.mark_in_frame is not None else 0.0
-        out_sec = (self.mark_out_frame / self.fps) if self.mark_out_frame is not None else self.duration
+        in_sec = self.mark_in_time if self.mark_in_time is not None else 0.0
+        out_sec = self.mark_out_time if self.mark_out_time is not None else self.duration
         dur = out_sec - in_sec
 
-        base, ext = os.path.splitext(self.video_path)
-        out_path = f"{base}.clip{ext}"
+        base, _ = os.path.splitext(self.video_path)
+        out_path = f"{base}.clip.mp4"
+
+        cmd = [FFMPEG_PATH, "-y", "-ss", f"{in_sec:.3f}", "-i", self.video_path,
+               "-to", f"{out_sec:.3f}", "-c", "copy", "-map", "0", out_path]
 
         # ── 弹出进度窗口 ──
         pw = tk.Toplevel(self.root)
         pw.title("裁剪进度")
-        w, h = 520, 360
+        w, h = 520, 300
         x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
         pw.geometry(f"{w}x{h}+{x}+{y}")
@@ -569,7 +509,8 @@ class VideoCutter:
         pw.grab_set()
         pw.protocol("WM_DELETE_WINDOW", lambda: None)
 
-        ttk.Label(pw, text="正在裁剪视频", font=('', 12)).pack(pady=(12, 0))
+        ttk.Label(pw, text=f"裁剪: {self._fmt(in_sec)} → {self._fmt(out_sec)}  ({dur:.1f}s)",
+                  font=('', 10)).pack(pady=(12, 0))
 
         status_lbl = ttk.Label(pw, text="", font=('', 9))
         status_lbl.pack()
@@ -577,7 +518,7 @@ class VideoCutter:
         pbar = ttk.Progressbar(pw, mode='determinate', length=480)
         pbar.pack(pady=(2, 6), padx=12)
 
-        log_area = tk.Text(pw, height=12, wrap=tk.WORD, state=tk.DISABLED,
+        log_area = tk.Text(pw, height=10, wrap=tk.WORD, state=tk.DISABLED,
                            font=('Consolas', 9), bg='#1e1e1e', fg='#d4d4d4')
         log_area.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
 
@@ -638,18 +579,14 @@ class VideoCutter:
         cancel_btn.configure(command=on_cancel)
 
         t = threading.Thread(target=self._cut_worker, args=(
-            in_sec, out_sec, dur, out_path, ui_log, ui_status, ui_progress, ui_finish,
+            cmd, dur, in_sec, out_sec, out_path,
+            ui_log, ui_status, ui_progress, ui_finish,
         ), daemon=True)
         t.start()
 
-    def _cut_worker(self, in_sec, out_sec, dur, out_path,
+    def _cut_worker(self, cmd, dur, in_sec, out_sec, out_path,
                     ui_log, ui_status, ui_progress, ui_finish):
-        """后台线程：执行所有 ffmpeg 命令"""
-        temp_dir = tempfile.mkdtemp()
-
-        def fmt_path(p):
-            return p.replace('\\', '/')
-
+        """后台线程：单条 ffmpeg -c copy 命令"""
         def schedule(fn, *args):
             self.root.after(0, fn, *args)
 
@@ -659,48 +596,9 @@ class VideoCutter:
         def progress(val, msg=''):
             schedule(ui_progress, val, msg)
 
-        # ── 等待预处理完成（进度权重按全长/片段比例动态计算） ──
-        # 全长越长、片段越短 → 预处理占比越大
-        pre_w = max(5, min(35, int(30 * self.duration / (self.duration + dur * 3))))
-        if not self._pre_audio_done.is_set() or not self._pre_kf_done.is_set():
-            # 立即显示当前进度（预处理已提前运行）
-            ap = self._pre_audio_progress if not self._pre_audio_done.is_set() else 1.0
-            kp = self._pre_kf_progress if not self._pre_kf_done.is_set() else 1.0
-            start_prog = int(pre_w * (ap + kp) / 2.0)
-            progress(start_prog, "⏳ 等待后台预处理完成…")
-            started = time.time()
-            while not self._pre_audio_done.is_set() or not self._pre_kf_done.is_set():
-                if self._cancel_requested:
-                    raise CancelError()
-                elapsed = int(time.time() - started)
-                ap = self._pre_audio_progress if not self._pre_audio_done.is_set() else 1.0
-                kp = self._pre_kf_progress if not self._pre_kf_done.is_set() else 1.0
-                combined = (ap + kp) / 2.0
-                prog_val = int(pre_w * combined)
-                waiting = []
-                if not self._pre_audio_done.is_set():
-                    waiting.append(f"音频提取 {int(ap * 100)}%")
-                if not self._pre_kf_done.is_set():
-                    waiting.append(f"关键帧扫描 {int(kp * 100)}%")
-                status(f"预处理: {'、'.join(waiting)} — 已等待 {elapsed}s")
-                progress(prog_val)
-                time.sleep(1)
-            elapsed = int(time.time() - started)
-            progress(pre_w, f"✔ 预处理完成（耗时 {elapsed}s）")
-        else:
-            progress(pre_w, "✔ 预处理已就绪")
+        try:
+            progress(0, "开始流复制…")
 
-        # 动态权重：编码步骤的权重根据各段时长分配
-        copy_w = 2   # 音频裁切（-c copy 很快）
-        concat_w, mux_w = 5, 7
-        base_w = pre_w + copy_w + concat_w + mux_w
-        encode_w = 100 - base_w
-
-        def ffmpeg_run(cmd, desc, w_start, w_end, seg_dur=None):
-            """执行 ffmpeg 命令，seg_dur 为段时长（秒），用于子进度解析"""
-            if self._cancel_requested:
-                raise CancelError()
-            progress(w_start, f"[ffmpeg] {desc}...")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=subprocess.CREATE_NO_WINDOW,
                                    universal_newlines=True, errors='replace')
@@ -708,151 +606,44 @@ class VideoCutter:
             err_tail = []
             try:
                 for line in iter(proc.stderr.readline, ''):
-                    err_tail.append(line)
-                    if len(err_tail) > 80:
-                        err_tail.pop(0)
                     if self._cancel_requested:
                         proc.kill()
                         proc.wait()
                         break
-                    if seg_dur and 'time=' in line:
+                    # ffmpeg 进度行: "frame=... time=... speed=..." → 状态栏
+                    if line.startswith('frame=') or line.startswith('size='):
+                        status(line.strip())
+                    if 'time=' in line:
+                        err_tail.append(line)
+                        if len(err_tail) > 3:
+                            err_tail.pop(0)
                         m = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
                         if m:
                             elapsed = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                            ratio = min(elapsed / seg_dur, 0.99)
-                            progress(w_start + int(ratio * (w_end - w_start)))
+                            ratio = min(elapsed / dur, 0.99) if dur > 0 else 0
+                            progress(int(ratio * 100))
+                    elif line.strip():
+                        err_tail.append(line)
+                        if len(err_tail) > 80:
+                            err_tail.pop(0)
                 proc.wait()
             finally:
                 self._running_procs.remove(proc)
+
             if self._cancel_requested:
                 raise CancelError()
             if proc.returncode != 0:
                 raise RuntimeError(''.join(err_tail[-20:])[-400:])
-            progress(w_end, f"  ✔ {desc} 完成")
-
-        try:
-            current = 0.0
-
-            # ── 1. 裁切音频 ──
-            audio_path = fmt_path(os.path.join(temp_dir, "audio.m4a"))
-            if self._pre_audio_path:
-                ffmpeg_run([
-                    FFMPEG_PATH, "-y", "-ss", f"{in_sec:.3f}", "-t", f"{dur:.3f}",
-                    "-i", self._pre_audio_path,
-                    "-c", "copy", audio_path
-                ], "裁切音频", current, current + copy_w)
-            else:
-                ffmpeg_run([
-                    FFMPEG_PATH, "-y", "-i", self.video_path,
-                    "-ss", f"{in_sec:.3f}", "-t", f"{dur:.3f}",
-                    "-vn", "-c:a", "aac", "-b:a", "64k", audio_path
-                ], "提取音频", current, current + copy_w)
-            current += copy_w
-
-            # ── 2. 关键帧匹配 ──
-            kfs = self._pre_keyframes if self._pre_keyframes else self._find_keyframes(self.video_path)
-            if self._cancel_requested:
-                raise CancelError()
-            progress(current, f"  关键帧: {len(kfs)} 个，匹配中...")
-
-            kf_before_in = next((t for t in reversed(kfs) if t < in_sec), None)
-            kf_after_in = next((t for t in kfs if t >= in_sec), None)
-            if kf_before_in and (in_sec - kf_before_in < 0.1):
-                kf_after_in = kf_before_in
-            kf_before_out = next((t for t in reversed(kfs) if t <= out_sec), None)
-            kf_after_out = next((t for t in kfs if t > out_sec), None)
-            if kf_after_out and (kf_after_out - out_sec < 0.1):
-                kf_before_out = kf_after_out
-
-            has_start_seg = kf_after_in and kf_before_out and kf_after_in < kf_before_out and (kf_after_in - in_sec > 0.1)
-            has_mid_seg = kf_after_in and kf_before_out and kf_after_in < kf_before_out
-            has_end_seg = kf_after_in and kf_before_out and kf_after_in < kf_before_out and (out_sec - kf_before_out > 0.1)
-
-            video_parts = []
-
-            enc_params = ["-c:v", "libx264", "-crf", "23", "-preset", "fast",
-                          "-profile:v", "main", "-level", "4.0", "-an"]
-            # ── 3. 编码视频段 ──
-            if has_mid_seg:
-                mid_w = 1  # 中间段 -c copy 很快
-                segs_enc = []  # 需重编码的段
-                if has_start_seg:
-                    segs_enc.append(("s1", "段1: 起点~关键帧", in_sec, kf_after_in))
-                if has_end_seg:
-                    segs_enc.append(("s3", "段3: 关键帧~终点", kf_before_out, out_sec))
-                total_enc = sum(e - s for _, _, s, e in segs_enc) if segs_enc else 1
-
-                for tag, label, seg_start, seg_end in segs_enc:
-                    seg_dur = seg_end - seg_start
-                    seg_w = (encode_w - mid_w) * seg_dur / total_enc
-                    seg_path = fmt_path(os.path.join(temp_dir, f"{tag}.mp4"))
-                    ffmpeg_run([
-                        FFMPEG_PATH, "-y", "-ss", f"{seg_start:.3f}", "-i", self.video_path,
-                        "-t", f"{seg_dur:.3f}", *enc_params, seg_path
-                    ], f"{label} ({self._fmt(seg_start)}→{self._fmt(seg_end)})",
-                        current, current + seg_w, seg_dur=seg_dur)
-                    current += seg_w
-                    video_parts.append(seg_path)
-
-                # 段2: 关键帧间无损复制
-                s2 = fmt_path(os.path.join(temp_dir, "s2.mp4"))
-                ffmpeg_run([
-                    FFMPEG_PATH, "-y", "-ss", f"{kf_after_in:.3f}", "-i", self.video_path,
-                    "-t", f"{kf_before_out - kf_after_in:.3f}",
-                    "-c", "copy", "-an", s2
-                ], f"段2: 无损复制 ({self._fmt(kf_after_in)}→{self._fmt(kf_before_out)})",
-                    current, current + mid_w)
-                current += mid_w
-                video_parts.insert(1 if has_start_seg else 0, s2)
-            else:
-                s_all = fmt_path(os.path.join(temp_dir, "s_all.mp4"))
-                ffmpeg_run([
-                    FFMPEG_PATH, "-y", "-ss", f"{in_sec:.3f}", "-i", self.video_path,
-                    "-t", f"{dur:.3f}", *enc_params, s_all
-                ], f"整体重新编码 ({self._fmt(in_sec)}→{self._fmt(out_sec)})",
-                    current, current + encode_w, seg_dur=dur)
-                current += encode_w
-                video_parts.append(s_all)
-
-            # ── 4. 合并视频段 ──
-            if len(video_parts) == 1:
-                v_concat = video_parts[0]
-                schedule(ui_progress, current, "单段视频，跳过合并")
-            else:
-                concat_list = fmt_path(os.path.join(temp_dir, "list.txt"))
-                with open(concat_list, 'w', encoding='utf-8') as f:
-                    for seg in video_parts:
-                        f.write(f"file '{seg}'\n")
-                v_concat = fmt_path(os.path.join(temp_dir, "v_concat.mp4"))
-                ffmpeg_run([
-                    FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0",
-                    "-i", concat_list, "-c", "copy",
-                    "-bsf:v", "h264_mp4toannexb", v_concat
-                ], f"合并 {len(video_parts)} 个视频段", current, current + concat_w)
-            current += concat_w
-
-            # ── 5. 混流音视频 ──
-            tmp_out = fmt_path(os.path.join(temp_dir, "v_final.mp4"))
-            ffmpeg_run([
-                FFMPEG_PATH, "-y", "-i", v_concat, "-i", audio_path,
-                "-c", "copy", "-map", "0:v:0", "-map", "1:a:0",
-                "-shortest", tmp_out
-            ], "混流音视频", current, min(current + mux_w, 99))
-            shutil.copy2(tmp_out, out_path)
 
             size = os.path.getsize(out_path)
             schedule(ui_finish, size, False, None)
 
         except CancelError:
             schedule(ui_finish, None, True, None)
-        except subprocess.TimeoutExpired:
-            schedule(ui_finish, None, False, "裁剪超时，视频可能过长")
         except RuntimeError as e:
             schedule(ui_finish, None, False, str(e))
         except Exception as e:
             schedule(ui_finish, None, False, str(e))
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
     # ── 拖放支持（Windows Shell API） ────────────────────────
 
@@ -950,10 +741,6 @@ class VideoCutter:
         if ret:
             self._show_frame(frame)
         self._update_time()
-
-        # 启动后台预处理（音频 + 关键帧）
-        self._start_preprocessing(path)
-
     # ── 轮询（主循环帧更新） ──────────────────────────────────
 
     def _poll(self):
