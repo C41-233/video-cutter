@@ -299,6 +299,19 @@ class VideoCutter:
         self._update_progress_canvas()
         self._update_time()
 
+    def _seek_to_frame(self, frame_no):
+        """跳转到指定帧并更新显示"""
+        if self.cap is None:
+            return
+        frame_no = max(0, min(frame_no, self.total_frames - 1))
+        self.current_frame = frame_no
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        ret, frame = self.cap.read()
+        if ret:
+            self._show_frame(frame)
+        self._update_progress_canvas()
+        self._update_time()
+
     # ── 进度条拖拽 ────────────────────────────────────────────
 
     # ── 进度条绘制（Canvas 自绘） ──────────────────────────────
@@ -402,6 +415,7 @@ class VideoCutter:
         snapped = self._snap_keyframe(raw_t, 'backward')
         self.mark_in_time = snapped
         self.mark_in_frame = int(snapped * self.fps)
+        self._seek_to_frame(self.mark_in_frame)
         self.mark_in_lbl.configure(text=f"起点: {self._fmt(snapped)}")
         self.status_var.set(f"标记起点: {self._fmt(snapped)} (帧 {self.mark_in_frame})")
         self._update_progress_canvas()
@@ -414,6 +428,7 @@ class VideoCutter:
         snapped = self._snap_keyframe(raw_t, 'forward')
         self.mark_out_time = snapped
         self.mark_out_frame = int(snapped * self.fps)
+        self._seek_to_frame(self.mark_out_frame)
         self.mark_out_lbl.configure(text=f"终点: {self._fmt(snapped)}")
         self.status_var.set(f"标记终点: {self._fmt(snapped)} (帧 {self.mark_out_frame})")
         self._update_progress_canvas()
@@ -515,8 +530,14 @@ class VideoCutter:
         status_lbl = ttk.Label(pw, text="", font=('', 9))
         status_lbl.pack()
 
-        pbar = ttk.Progressbar(pw, mode='determinate', length=480)
-        pbar.pack(pady=(2, 6), padx=12)
+        bar_frame = ttk.Frame(pw)
+        bar_frame.pack(pady=(2, 6), padx=12, fill=tk.X)
+
+        pbar = ttk.Progressbar(bar_frame, mode='determinate', length=440)
+        pbar.pack(side=tk.LEFT)
+
+        pct_lbl = ttk.Label(bar_frame, text="0%", width=5, anchor=tk.E)
+        pct_lbl.pack(side=tk.RIGHT)
 
         log_area = tk.Text(pw, height=10, wrap=tk.WORD, state=tk.DISABLED,
                            font=('Consolas', 9), bg='#1e1e1e', fg='#d4d4d4')
@@ -533,10 +554,24 @@ class VideoCutter:
         pw.update()
 
         # ── 主线程 UI 更新函数 ──
+        _log_has_live = [False]  # 追踪最后一行是否为实时进度
+
         def ui_log(msg, color='#d4d4d4'):
+            _log_has_live[0] = False
             log_area.configure(state=tk.NORMAL)
             log_area.insert(tk.END, msg + '\n', ('msg',))
             log_area.tag_configure('msg', foreground=color)
+            log_area.see(tk.END)
+            log_area.configure(state=tk.DISABLED)
+
+        def ui_log_live(text):
+            """更新日志最后一行为 ffmpeg 实时状态（原地替换）"""
+            log_area.configure(state=tk.NORMAL)
+            if _log_has_live[0]:
+                log_area.delete('end-2l', 'end-1l')
+            _log_has_live[0] = True
+            log_area.insert(tk.END, '  > ' + text + '\n', ('live',))
+            log_area.tag_configure('live', foreground='#888888')
             log_area.see(tk.END)
             log_area.configure(state=tk.DISABLED)
 
@@ -545,6 +580,7 @@ class VideoCutter:
 
         def ui_progress(val, msg=''):
             pbar['value'] = val
+            pct_lbl.configure(text=f"{val}%")
             if msg:
                 ui_log(msg)
 
@@ -580,15 +616,21 @@ class VideoCutter:
 
         t = threading.Thread(target=self._cut_worker, args=(
             cmd, dur, in_sec, out_sec, out_path,
-            ui_log, ui_status, ui_progress, ui_finish,
+            ui_log, ui_log_live, ui_status, ui_progress, ui_finish,
         ), daemon=True)
         t.start()
 
     def _cut_worker(self, cmd, dur, in_sec, out_sec, out_path,
-                    ui_log, ui_status, ui_progress, ui_finish):
+                    ui_log, ui_log_live, ui_status, ui_progress, ui_finish):
         """后台线程：单条 ffmpeg -c copy 命令"""
         def schedule(fn, *args):
             self.root.after(0, fn, *args)
+
+        def log(msg, color=None):
+            schedule(ui_log, msg, color) if color else schedule(ui_log, msg)
+
+        def log_live(text):
+            schedule(ui_log_live, text)
 
         def status(text):
             schedule(ui_status, text)
@@ -610,9 +652,9 @@ class VideoCutter:
                         proc.kill()
                         proc.wait()
                         break
-                    # ffmpeg 进度行: "frame=... time=... speed=..." → 状态栏
+                    # ffmpeg 进度行 → 日志原地刷新
                     if line.startswith('frame=') or line.startswith('size='):
-                        status(line.strip())
+                        log_live(line.strip())
                     if 'time=' in line:
                         err_tail.append(line)
                         if len(err_tail) > 3:
