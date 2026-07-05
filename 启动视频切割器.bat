@@ -1,8 +1,6 @@
 @echo off
-chcp 65001 >nul
-title è§†é¢‘åˆ‡å‰²å™¨
-
+title ÊÓÆµÇĞ¸îÆ÷
 cd /d "%~dp0"
-echo æ­£åœ¨å¯åŠ¨è§†é¢‘åˆ‡å‰²å™¨...
+echo ÕıÔÚÆô¶¯ÊÓÆµÇĞ¸îÆ÷...
 start "" "pythonw.exe" "%~dp0video_cutter.py"
 exit
