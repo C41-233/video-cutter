@@ -35,6 +35,14 @@ class VideoCutter:
         self.root.minsize(640, 480)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # 禁用输入法，防止快捷键被 IME 拦截
+        try:
+            imm32 = ctypes.windll.imm32
+            hwnd = self.root.winfo_id()
+            imm32.ImmAssociateContext(ctypes.wintypes.HWND(hwnd), None)
+        except Exception:
+            pass
+
         # 活跃子进程追踪（用于退出时清理）
         self._running_procs = []
         self._running = True
@@ -134,9 +142,17 @@ class VideoCutter:
                                         width=3, takefocus=False)
         self.step_back_btn.pack(side=tk.LEFT, padx=2)
 
+        self.seek_back_btn = ttk.Button(center, text="⏪", command=lambda: self.seek_seconds(-1),
+                                        state=tk.DISABLED, style='Play.TButton', width=3, takefocus=False)
+        self.seek_back_btn.pack(side=tk.LEFT, padx=2)
+
         self.play_btn = ttk.Button(center, text="▶", command=self.toggle_play,
                                    state=tk.DISABLED, style='Play.TButton', width=3, takefocus=False)
         self.play_btn.pack(side=tk.LEFT, padx=2)
+
+        self.seek_fwd_btn = ttk.Button(center, text="⏩", command=lambda: self.seek_seconds(1),
+                                       state=tk.DISABLED, style='Play.TButton', width=3, takefocus=False)
+        self.seek_fwd_btn.pack(side=tk.LEFT, padx=2)
 
         self.step_fwd_btn = ttk.Button(center, text="▶|", style='Play.TButton',
                                        command=lambda: self.frame_step(1), state=tk.DISABLED,
@@ -247,6 +263,8 @@ class VideoCutter:
         self.mark_out_lbl.configure(text="终点: ─")
         self.play_btn.configure(state=tk.DISABLED, text="▶")
         self.step_back_btn.configure(state=tk.DISABLED)
+        self.seek_back_btn.configure(state=tk.DISABLED)
+        self.seek_fwd_btn.configure(state=tk.DISABLED)
         self.step_fwd_btn.configure(state=tk.DISABLED)
         self.mark_in_btn.configure(state=tk.DISABLED)
         self.mark_out_btn.configure(state=tk.DISABLED)
@@ -772,6 +790,8 @@ class VideoCutter:
         self._update_progress_canvas()
         self.play_btn.configure(state=tk.NORMAL, text="▶")
         self.step_back_btn.configure(state=tk.NORMAL)
+        self.seek_back_btn.configure(state=tk.NORMAL)
+        self.seek_fwd_btn.configure(state=tk.NORMAL)
         self.step_fwd_btn.configure(state=tk.NORMAL)
         self.mark_in_btn.configure(state=tk.NORMAL)
         self.mark_out_btn.configure(state=tk.NORMAL)
