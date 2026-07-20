@@ -20,7 +20,37 @@ import ctypes
 import ctypes.wintypes
 import threading
 
-FFMPEG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ffmpeg.exe")
+def _get_base_dir():
+    """资源文件基目录：打包模式用 sys._MEIPASS，开发模式用脚本目录"""
+    if getattr(sys, 'frozen', False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_ffmpeg():
+    """定位 ffmpeg.exe（打包后搜exe周围，开发时搜脚本周围，兜底PATH）"""
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        candidates = [os.path.join(exe_dir, "ffmpeg.exe")]
+        # 向上最多搜 4 层
+        parent = exe_dir
+        for _ in range(4):
+            parent = os.path.dirname(parent)
+            candidates.append(os.path.join(parent, "ffmpeg.exe"))
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(os.path.dirname(script_dir), "ffmpeg.exe"),
+            os.path.join(script_dir, "ffmpeg.exe"),
+        ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    found = shutil.which("ffmpeg.exe")
+    return found if found else "ffmpeg.exe"
+
+
+FFMPEG_PATH = _find_ffmpeg()
 
 
 class CancelError(Exception):
@@ -32,6 +62,11 @@ class VideoCutter:
         self.root = tk.Tk()
         self.root.title("简易视频切割器")
         self.root.geometry("960x640")
+
+        # 设置窗口图标（避免显示默认 Python 图标）
+        icon_path = os.path.join(_get_base_dir(), "video_cutter_icon.ico")
+        if os.path.exists(icon_path):
+            self.root.iconbitmap(icon_path)
         self.root.minsize(640, 480)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
