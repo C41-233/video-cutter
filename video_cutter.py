@@ -12,37 +12,19 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk, ImageDraw
 import subprocess
 import os
-import sys
 import re
-import tempfile
 import shutil
 import ctypes
 import ctypes.wintypes
 import threading
 
-def _get_base_dir():
-    """资源文件基目录：打包模式用 sys._MEIPASS，开发模式用脚本目录"""
-    if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
-    return os.path.dirname(os.path.abspath(__file__))
-
-
 def _find_ffmpeg():
-    """定位 ffmpeg.exe（打包后搜exe周围，开发时搜脚本周围，兜底PATH）"""
-    if getattr(sys, 'frozen', False):
-        exe_dir = os.path.dirname(sys.executable)
-        candidates = [os.path.join(exe_dir, "ffmpeg.exe")]
-        # 向上最多搜 4 层
-        parent = exe_dir
-        for _ in range(4):
-            parent = os.path.dirname(parent)
-            candidates.append(os.path.join(parent, "ffmpeg.exe"))
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates = [
-            os.path.join(os.path.dirname(script_dir), "ffmpeg.exe"),
-            os.path.join(script_dir, "ffmpeg.exe"),
-        ]
+    """定位 ffmpeg.exe（优先上级目录，兜底脚本目录和PATH）"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(os.path.dirname(script_dir), "ffmpeg.exe"),
+        os.path.join(script_dir, "ffmpeg.exe"),
+    ]
     for p in candidates:
         if os.path.exists(p):
             return p
