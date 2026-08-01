@@ -279,6 +279,24 @@ class VideoCutter:
         s = r - m * 60
         return f"{h}:{m:02d}:{s:05.2f}"
 
+    @staticmethod
+    def _fmt_dur(sec):
+        """秒数格式化为 HH:MM:SS"""
+        h = int(sec // 3600)
+        m = int(sec % 3600 // 60)
+        s = int(sec % 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    @staticmethod
+    def _fmt_size(n):
+        """字节数格式化为 B/KB/MB/GB，小数末尾 0 不显示"""
+        size = float(n)
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if size < 1024 or unit == 'GB':
+                s = f"{size:.3f}".rstrip('0').rstrip('.')
+                return f"{s} {unit}"
+            size /= 1024
+
     def _close_video(self):
         """关闭当前视频，恢复初始状态"""
         if self.cap:
@@ -650,7 +668,8 @@ class VideoCutter:
                 ui_log(f"\n✅ 裁剪完成!", '#4ec9b0')
                 ui_log(f"   输出: {os.path.basename(out_path)}")
                 ui_log(f"   范围: {self._fmt(in_sec)} → {self._fmt(out_sec)}  ({dur:.1f}s)")
-                ui_log(f"   大小: {size // 1024} KB")
+                ui_log(f"   时长: {self._fmt_dur(dur)}")
+                ui_log(f"   大小: {self._fmt_size(size)}")
                 self.status_var.set(f"裁剪完成: {os.path.basename(out_path)} ({size // 1024} KB)")
                 def on_close():
                     self._close_video()
@@ -694,6 +713,12 @@ class VideoCutter:
             schedule(ui_progress, val, msg)
 
         try:
+            try:
+                src_size = os.path.getsize(self.video_path)
+                progress(0, f"源视频大小: {self._fmt_size(src_size)}")
+                progress(0, f"源视频时长: {self._fmt_dur(self.duration)}")
+            except Exception:
+                pass
             progress(0, "开始流复制…")
 
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
