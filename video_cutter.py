@@ -9,7 +9,7 @@
 import cv2
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import subprocess
 import os
 import sys
@@ -59,14 +59,28 @@ class CancelError(Exception):
 
 class VideoCutter:
     def __init__(self):
+        # 必须在创建任何窗口之前设置 AppUserModelID，
+        # 否则任务栏仍显示 pythonw.exe 的图标
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VideoCutter.App")
+        except Exception:
+            pass
+
         self.root = tk.Tk()
         self.root.title("简易视频切割器")
         self.root.geometry("960x640")
 
-        # 设置窗口图标（避免显示默认 Python 图标）
-        icon_path = os.path.join(_get_base_dir(), "video_cutter_icon.ico")
-        if os.path.exists(icon_path):
-            self.root.iconbitmap(icon_path)
+        # 设置窗口图标（Tk 原生 iconphoto，蓝底白三角）
+        try:
+            icon = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(icon)
+            d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=(74, 144, 217, 255))
+            d.polygon([(22, 16), (22, 48), (46, 32)], fill=(255, 255, 255, 255))
+            self._icon_img = ImageTk.PhotoImage(icon)
+            self.root.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
+
         self.root.minsize(640, 480)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -129,14 +143,17 @@ class VideoCutter:
         toolbar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(8, 0))
 
         ttk.Button(toolbar, text="📂 打开文件", command=self.open_video, takefocus=False).pack(side=tk.LEFT, padx=2)
-        ttk.Label(toolbar, text="  或将视频文件拖入窗口").pack(side=tk.LEFT, padx=4)
+        self.close_file_btn = ttk.Button(toolbar, text="✕ 关闭文件", command=self._close_video,
+                                         takefocus=False)
+        self.close_file_btn.pack(side=tk.LEFT, padx=2)
+        self.close_file_btn.pack_forget()  # 初始隐藏
 
         # 视频显示区域
         video_frame = ttk.Frame(self.root, relief=tk.SUNKEN, borderwidth=2)
         video_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
         video_frame.pack_propagate(False)
 
-        self.video_label = ttk.Label(video_frame, text="打开视频文件开始使用\n\n快捷键：\n  空格 = 播放/暂停\n  ←/→ = 后退/快进 5 秒\n  A/D  = 逐帧进退\n  Z    = 标记起点\n  X    = 标记终点\n\n或将视频文件拖入窗口",
+        self.video_label = ttk.Label(video_frame, text="打开视频文件开始使用\n\n快捷键：\n  空格 = 播放/暂停\n  ←/→ = 后退/快进 5 秒\n  A/D  = 逐秒进退\n  Ctrl+A/D = 逐帧进退\n  Z    = 标记起点\n  X    = 标记终点\n\n或将视频文件拖入窗口",
                                      anchor=tk.CENTER, justify=tk.CENTER)
         self.video_label.pack(fill=tk.BOTH, expand=True)
 
@@ -218,10 +235,12 @@ class VideoCutter:
 
         # 键盘快捷键
         self.root.bind("<space>", lambda e: self.toggle_play())
-        self.root.bind("a", lambda e: self.frame_step(-1))
-        self.root.bind("A", lambda e: self.frame_step(-1))
-        self.root.bind("d", lambda e: self.frame_step(1))
-        self.root.bind("D", lambda e: self.frame_step(1))
+        self.root.bind("a", lambda e: self.seek_seconds(-1))
+        self.root.bind("A", lambda e: self.seek_seconds(-1))
+        self.root.bind("d", lambda e: self.seek_seconds(1))
+        self.root.bind("D", lambda e: self.seek_seconds(1))
+        self.root.bind("<Control-a>", lambda e: self.frame_step(-1))
+        self.root.bind("<Control-d>", lambda e: self.frame_step(1))
         self.root.bind("z", lambda e: self.mark_in())
         self.root.bind("Z", lambda e: self.mark_in())
         self.root.bind("x", lambda e: self.mark_out())
@@ -290,7 +309,7 @@ class VideoCutter:
         self.current_frame = 0
         self.mark_in_frame = None
         self.mark_out_frame = None
-        self.video_label.configure(image='', text="打开视频文件开始使用\n\n快捷键：\n  空格 = 播放/暂停\n  ←/→ = 后退/快进 5 秒\n  A/D  = 逐帧进退\n  Z    = 标记起点\n  X    = 标记终点\n\n或将视频文件拖入窗口")
+        self.video_label.configure(image='', text="打开视频文件开始使用\n\n快捷键：\n  空格 = 播放/暂停\n  ←/→ = 后退/快进 5 秒\n  A/D  = 逐秒进退\n  Ctrl+A/D = 逐帧进退\n  Z    = 标记起点\n  X    = 标记终点\n\n或将视频文件拖入窗口")
         self.photo = None
         self.progress_canvas.delete('all')
         self.time_label.configure(text="0:00:00.00 / 0:00:00.00")
@@ -305,6 +324,7 @@ class VideoCutter:
         self.mark_out_btn.configure(state=tk.DISABLED)
         self.mark_in_time = None
         self.mark_out_time = None
+        self.close_file_btn.pack_forget()
         self.status_var.set("就绪")
 
     # ── 播放控制 ──────────────────────────────────────────────
@@ -823,6 +843,7 @@ class VideoCutter:
 
         self.progress_canvas.delete('all')
         self._update_progress_canvas()
+        self.close_file_btn.pack(side=tk.LEFT, padx=2)
         self.play_btn.configure(state=tk.NORMAL, text="▶")
         self.step_back_btn.configure(state=tk.NORMAL)
         self.seek_back_btn.configure(state=tk.NORMAL)
