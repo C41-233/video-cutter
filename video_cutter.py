@@ -622,8 +622,10 @@ class VideoCutter:
 
         btn_frame = ttk.Frame(pw)
         btn_frame.pack(pady=(0, 8))
-        cancel_btn = ttk.Button(btn_frame, text="中止", width=12)
-        cancel_btn.pack()
+        btn_row = ttk.Frame(btn_frame)
+        btn_row.pack()
+        cancel_btn = ttk.Button(btn_row, text="中止", width=12)
+        cancel_btn.pack(side=tk.LEFT)
         pw.update()
 
         # ── 主线程 UI 更新函数 ──
@@ -671,8 +673,21 @@ class VideoCutter:
                 ui_log(f"   时长: {self._fmt_dur(dur)}")
                 ui_log(f"   大小: {self._fmt_size(size)}")
                 self.status_var.set(f"裁剪完成: {os.path.basename(out_path)} ({size // 1024} KB)")
+                del_var = tk.BooleanVar(value=False)
+                ttk.Checkbutton(btn_row, text="删除源文件", variable=del_var
+                                ).pack(side=tk.LEFT, padx=(8, 0))
                 def on_close():
-                    self._close_video()
+                    path = self.video_path  # _close_video() 会清空 self.video_path，先保存
+                    self._close_video()     # 释放 OpenCV/ffmpeg 句柄，否则删除会因占用失败
+                    if del_var.get():
+                        if not self._send_to_recycle_bin(path):
+                            pw.grab_release()  # grab 会拦截弹窗交互，先释放
+                            messagebox.showerror("错误",
+                                                 f"无法将源文件移入回收站:\n{path}\n\n文件可能被其他程序占用。",
+                                                 parent=pw)
+                            pw.grab_set()
+                            return  # 保持窗口打开，用户可取消勾选后重试
+                        self.status_var.set("源文件已移入回收站")
                     pw.destroy()
                 close_cmd = on_close
             pw.grab_release()
