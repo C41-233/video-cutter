@@ -583,7 +583,7 @@ class VideoCutter:
         out_path = f"{base}.clip.mp4"
 
         cmd = [FFMPEG_PATH, "-y", "-ss", f"{in_sec:.3f}", "-i", self.video_path,
-               "-to", f"{out_sec:.3f}", "-c", "copy", "-map", "0", out_path]
+               "-t", f"{dur:.3f}", "-c", "copy", "-map", "0", out_path]
 
         # ── 弹出进度窗口 ──
         pw = tk.Toplevel(self.root)
