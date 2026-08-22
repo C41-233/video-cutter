@@ -767,6 +767,49 @@ class VideoCutter:
         except Exception as e:
             schedule(ui_finish, None, False, str(e))
 
+    # ── 回收站 ──────────────────────────────────────────────
+
+    def _send_to_recycle_bin(self, path):
+        """将文件移入回收站，成功返回 True"""
+        try:
+            if not os.path.exists(path):
+                return False
+
+            class SHFILEOPSTRUCTW(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", ctypes.wintypes.HWND),
+                    ("wFunc", ctypes.c_uint),
+                    ("pFrom", ctypes.c_wchar_p),
+                    ("pTo", ctypes.c_wchar_p),
+                    ("fFlags", ctypes.c_ushort),
+                    ("fAnyOperationsAborted", ctypes.c_int),
+                    ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", ctypes.c_wchar_p),
+                ]
+
+            FO_DELETE = 3
+            FOF_ALLOWUNDO = 0x40          # 删除进入回收站
+            FOF_SILENT = 0x04             # 不显示进度对话框
+            FOF_NOCONFIRMATION = 0x10     # 不弹确认框
+            FOF_NOERRORUI = 0x0400        # 错误由本函数返回值体现
+
+            fop = SHFILEOPSTRUCTW()
+            fop.hwnd = None
+            fop.wFunc = FO_DELETE
+            # pFrom 必须双 null 结尾（ctypes 自动转为 UTF-16 缓冲并持有引用）
+            fop.pFrom = path + '\0\0'
+            fop.pTo = None
+            fop.fFlags = FOF_ALLOWUNDO | FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI
+            fop.fAnyOperationsAborted = 0
+            fop.hNameMappings = None
+            fop.lpszProgressTitle = None
+
+            shell32 = ctypes.windll.shell32
+            result = shell32.SHFileOperationW(ctypes.byref(fop))
+            return result == 0
+        except Exception:
+            return False
+
     # ── 拖放支持（Windows Shell API） ────────────────────────
 
     def _enable_drag_drop(self):
