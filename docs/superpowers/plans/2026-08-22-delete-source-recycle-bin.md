@@ -194,7 +194,7 @@ Expected: 无输出错误，`Ran 2 tests ... OK`（回归确认）
 
 - [ ] **Step 4: 手动验证 GUI 全流程**
 
-1. 生成测试视频：`"ffmpeg" -y -f lavfi -i testsrc=duration=30:size=320x240:rate=30 -f lavfi -i sine=frequency=440:duration=30 -c:v libx264 -g 30 -c:a aac "%TEMP%\avdb_cut_test.mp4"`
+1. 生成测试视频：`ffmpeg -y -f lavfi -i testsrc=duration=30:size=320x240:rate=30 -f lavfi -i sine=frequency=440:duration=30 -c:v libx264 -g 30 -c:a aac "%TEMP%\avdb_cut_test.mp4"`
 2. 启动：`cd "<仓库根目录>" && python video_cutter.py`（或双击 启动视频切割器.bat），打开测试视频
 3. 标记起点（Z）→ 标记终点（X）→ 点「✂ 裁剪」→ 等待成功
 4. **断言 A**：成功窗口底部按钮右侧出现「删除源文件」复选框，默认未勾选
