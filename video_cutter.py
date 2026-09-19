@@ -100,6 +100,9 @@ class VideoCutter:
         self.mark_in_time = None
         self.mark_out_time = None
 
+        # 裁剪完成窗口的「删除源文件」勾选状态（同一进程内跨裁剪保持）
+        self.delete_source_var = tk.BooleanVar(value=False)
+
         self.setup_ui()
         self._enable_drag_drop()
 
@@ -239,7 +242,7 @@ class VideoCutter:
     def open_video(self):
         path = filedialog.askopenfilename(
             title="选择视频文件",
-            filetypes=[("视频文件", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv"),
+            filetypes=[("视频文件", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.ts *.m2ts *.mts"),
                        ("所有文件", "*.*")]
         )
         if path:
@@ -673,13 +676,12 @@ class VideoCutter:
                 ui_log(f"   时长: {self._fmt_dur(dur)}")
                 ui_log(f"   大小: {self._fmt_size(size)}")
                 self.status_var.set(f"裁剪完成: {os.path.basename(out_path)} ({size // 1024} KB)")
-                del_var = tk.BooleanVar(value=False)
-                ttk.Checkbutton(btn_row, text="删除源文件", variable=del_var
+                ttk.Checkbutton(btn_row, text="删除源文件", variable=self.delete_source_var
                                 ).pack(side=tk.LEFT, padx=(8, 0))
                 def on_close():
                     path = self.video_path  # _close_video() 会清空 self.video_path，先保存
                     self._close_video()     # 释放 OpenCV/ffmpeg 句柄，否则删除会因占用失败
-                    if del_var.get():
+                    if self.delete_source_var.get():
                         if not self._send_to_recycle_bin(path):
                             pw.grab_release()  # grab 会拦截弹窗交互，先释放
                             messagebox.showerror("错误",
@@ -876,12 +878,56 @@ class VideoCutter:
         except Exception as e:
             self.status_var.set(f"拖放支持加载失败: {e}")
 
+    def _is_video_file(self, path):
+        """通过文件头 magic bytes 识别视频文件（不依赖扩展名）"""
+        try:
+            with open(path, 'rb') as f:
+                head = f.read(4096)
+        except Exception:
+            return False
+        if not head:
+            return False
+        # MP4 / MOV / 3GP / M4V（ISO BMFF，偏移 4 处 "ftyp"）
+        if len(head) >= 8 and head[4:8] == b'ftyp':
+            return True
+        # AVI: "RIFF" .... "AVI "
+        if len(head) >= 12 and head[:4] == b'RIFF' and head[8:12] == b'AVI ':
+            return True
+        # MKV / WebM（EBML 头）
+        if head[:4] == b'\x1a\x45\xdf\xa3':
+            return True
+        # FLV
+        if head[:3] == b'FLV':
+            return True
+        # WMV / ASF
+        if head[:16] == b'\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c':
+            return True
+        # MPEG-TS：连续若干 188 字节包均以 0x47 同步字节开头
+        if head[0] == 0x47:
+            step = 188
+            n = min(len(head) // step, 5)
+            if n >= 2 and all(head[i * step] == 0x47 for i in range(1, n)):
+                return True
+        # M2TS（蓝光）：4 字节时间戳 + 188 字节 TS 包（192 字节/包）
+        if len(head) >= 5 and head[4] == 0x47:
+            step = 192
+            n = min(len(head) // step, 5)
+            if n >= 2 and all(head[i * step + 4] == 0x47 for i in range(1, n)):
+                return True
+        # MPEG-PS / VOB：00 00 01 BA
+        if head[:4] == b'\x00\x00\x01\xba':
+            return True
+        # Ogg（含 .ogv/.ogg）
+        if head[:4] == b'OggS':
+            return True
+        return False
+
     def _on_file_dropped(self, path):
-        """处理拖入的文件"""
-        ext = os.path.splitext(path)[1].lower()
-        if ext in (".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v"):
+        """处理拖入的文件（通过文件头识别，不依赖扩展名）"""
+        if self._is_video_file(path):
             self._load_video(path)
         else:
+            ext = os.path.splitext(path)[1].lower() or "(无扩展名)"
             self.status_var.set(f"不支持的文件格式: {ext}")
 
     def _load_video(self, path):
