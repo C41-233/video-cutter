@@ -35,6 +35,23 @@ def _find_ffmpeg():
 FFMPEG_PATH = _find_ffmpeg()
 
 
+def _find_mkvmerge():
+    """定位 mkvmerge.exe（RealMedia 源无损切割用；优先与 ffmpeg 同级目录，兜底脚本目录和PATH）"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(os.path.dirname(script_dir), "mkvmerge.exe"),
+        os.path.join(script_dir, "mkvmerge.exe"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    found = shutil.which("mkvmerge.exe")
+    return found if found else "mkvmerge.exe"
+
+
+MKVMERGE_PATH = _find_mkvmerge()
+
+
 class CancelError(Exception):
     pass
 
@@ -242,7 +259,7 @@ class VideoCutter:
     def open_video(self):
         path = filedialog.askopenfilename(
             title="选择视频文件",
-            filetypes=[("视频文件", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.ts *.m2ts *.mts"),
+            filetypes=[("视频文件", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.ts *.m2ts *.mts *.rmvb *.rm"),
                        ("所有文件", "*.*")]
         )
         if path:
@@ -299,6 +316,14 @@ class VideoCutter:
                 s = f"{size:.3f}".rstrip('0').rstrip('.')
                 return f"{s} {unit}"
             size /= 1024
+
+    @staticmethod
+    def _fmt_mkv_ts(sec):
+        """秒数格式化为 mkvmerge 时间戳 HH:MM:SS.mmm"""
+        sec = max(0.0, sec)
+        m, s = divmod(sec, 60)
+        h, m = divmod(int(m), 60)
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
 
     def _close_video(self):
         """关闭当前视频，恢复初始状态"""
@@ -583,10 +608,18 @@ class VideoCutter:
         dur = out_sec - in_sec
 
         base, _ = os.path.splitext(self.video_path)
-        out_path = f"{base}.clip.mp4"
-
-        cmd = [FFMPEG_PATH, "-y", "-ss", f"{in_sec:.3f}", "-i", self.video_path,
-               "-t", f"{dur:.3f}", "-c", "copy", "-map", "0", out_path]
+        is_rm = self._is_realmedia(self.video_path)
+        if is_rm:
+            # FFmpeg 各容器 muxer 均不封装 RealVideo/Cook，
+            # RM 源改用 mkvmerge 无损切割（Matroska 规范原生支持 Real 编码）
+            out_path = f"{base}.clip.mkv"
+            cmd = [MKVMERGE_PATH, "--output", out_path,
+                   "--split", f"parts:{self._fmt_mkv_ts(in_sec)}-{self._fmt_mkv_ts(out_sec)}",
+                   self.video_path]
+        else:
+            out_path = f"{base}.clip.mp4"
+            cmd = [FFMPEG_PATH, "-y", "-ss", f"{in_sec:.3f}", "-i", self.video_path,
+                   "-t", f"{dur:.3f}", "-c", "copy", "-map", "0", out_path]
 
         # ── 弹出进度窗口 ──
         pw = tk.Toplevel(self.root)
@@ -708,12 +741,14 @@ class VideoCutter:
         t = threading.Thread(target=self._cut_worker, args=(
             cmd, dur, in_sec, out_sec, out_path,
             ui_log, ui_log_live, ui_status, ui_progress, ui_finish,
+            'mkvmerge' if is_rm else 'ffmpeg',
         ), daemon=True)
         t.start()
 
     def _cut_worker(self, cmd, dur, in_sec, out_sec, out_path,
-                    ui_log, ui_log_live, ui_status, ui_progress, ui_finish):
-        """后台线程：单条 ffmpeg -c copy 命令"""
+                    ui_log, ui_log_live, ui_status, ui_progress, ui_finish,
+                    engine='ffmpeg'):
+        """后台线程：单条 ffmpeg -c copy 或 mkvmerge --split 命令"""
         def schedule(fn, *args):
             self.root.after(0, fn, *args)
 
@@ -736,43 +771,76 @@ class VideoCutter:
                 progress(0, f"源视频时长: {self._fmt_dur(self.duration)}")
             except Exception:
                 pass
-            progress(0, "开始流复制…")
 
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   creationflags=subprocess.CREATE_NO_WINDOW,
-                                   universal_newlines=True, errors='replace')
-            self._running_procs.append(proc)
-            err_tail = []
-            try:
-                for line in iter(proc.stderr.readline, ''):
-                    if self._cancel_requested:
-                        proc.kill()
-                        proc.wait()
-                        break
-                    # ffmpeg 进度行 → 日志原地刷新
-                    if line.startswith('frame=') or line.startswith('size='):
-                        log_live(line.strip())
-                    if 'time=' in line:
-                        err_tail.append(line)
-                        if len(err_tail) > 3:
-                            err_tail.pop(0)
-                        m = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+            is_rm = engine == 'mkvmerge'
+            progress(0, "开始 mkvmerge 无损切割…" if is_rm else "开始流复制…")
+
+            if is_rm:
+                # mkvmerge：进度/信息走 stdout，stderr 合并进来统一逐行解析
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,
+                                        creationflags=subprocess.CREATE_NO_WINDOW,
+                                        universal_newlines=True, errors='replace')
+                self._running_procs.append(proc)
+                err_tail = []
+                try:
+                    for line in iter(proc.stdout.readline, ''):
+                        if self._cancel_requested:
+                            proc.kill()
+                            proc.wait()
+                            break
+                        text = line.strip()
+                        # mkvmerge 进度行（\r 分隔，universal_newlines 已拆行）
+                        m = re.match(r'Progress: (\d+)%', text)
                         if m:
-                            elapsed = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                            ratio = min(elapsed / dur, 0.99) if dur > 0 else 0
-                            progress(int(ratio * 100))
-                    elif line.strip():
-                        err_tail.append(line)
-                        if len(err_tail) > 80:
-                            err_tail.pop(0)
-                proc.wait()
-            finally:
-                self._running_procs.remove(proc)
+                            log_live(text)
+                            progress(int(m.group(1)))
+                        elif text:
+                            err_tail.append(text)
+                            if len(err_tail) > 80:
+                                err_tail.pop(0)
+                    proc.wait()
+                finally:
+                    self._running_procs.remove(proc)
+            else:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       creationflags=subprocess.CREATE_NO_WINDOW,
+                                       universal_newlines=True, errors='replace')
+                self._running_procs.append(proc)
+                err_tail = []
+                try:
+                    for line in iter(proc.stderr.readline, ''):
+                        if self._cancel_requested:
+                            proc.kill()
+                            proc.wait()
+                            break
+                        # ffmpeg 进度行 → 日志原地刷新
+                        if line.startswith('frame=') or line.startswith('size='):
+                            log_live(line.strip())
+                        if 'time=' in line:
+                            err_tail.append(line)
+                            if len(err_tail) > 3:
+                                err_tail.pop(0)
+                            m = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+                            if m:
+                                elapsed = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                                ratio = min(elapsed / dur, 0.99) if dur > 0 else 0
+                                progress(int(ratio * 100))
+                        elif line.strip():
+                            err_tail.append(line)
+                            if len(err_tail) > 80:
+                                err_tail.pop(0)
+                    proc.wait()
+                finally:
+                    self._running_procs.remove(proc)
 
             if self._cancel_requested:
                 raise CancelError()
             if proc.returncode != 0:
                 raise RuntimeError(''.join(err_tail[-20:])[-400:])
+            if is_rm and not os.path.exists(out_path):
+                # mkvmerge 只在关键帧切割，区间内无关键帧时会静默不产出文件
+                raise RuntimeError("切割区段内未找到关键帧，未能产出文件；请调整起止点后重试")
 
             size = os.path.getsize(out_path)
             schedule(ui_finish, size, False, None)
@@ -920,7 +988,18 @@ class VideoCutter:
         # Ogg（含 .ogv/.ogg）
         if head[:4] == b'OggS':
             return True
+        # RM / RMVB（RealMedia）
+        if head[:4] == b'.RMF':
+            return True
         return False
+
+    def _is_realmedia(self, path):
+        """判断是否为 RealMedia 容器（.rm/.rmvb，文件头 .RMF）"""
+        try:
+            with open(path, 'rb') as f:
+                return f.read(4) == b'.RMF'
+        except Exception:
+            return False
 
     def _on_file_dropped(self, path):
         """处理拖入的文件（通过文件头识别，不依赖扩展名）"""
