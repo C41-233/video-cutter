@@ -222,13 +222,40 @@ class VideoCutter:
         self.mark_out_lbl = ttk.Label(right_info, text="终点: ─", width=14)
         self.mark_out_lbl.pack()
 
-        # 裁剪按钮行
+        # 主操作按钮行（分体按钮：主按钮 + ▾ 模式菜单）
         cut_row = ttk.Frame(self.root)
         cut_row.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
-        self.cut_btn = tk.Button(cut_row, text="✂ 裁剪", command=self.cut_video,
+
+        self.action_mode = 'cut'
+        self.mode_var = tk.StringVar(value='cut')
+        self.fmt_var = tk.StringVar(value='png')
+
+        action_area = ttk.Frame(cut_row)
+        action_area.pack()
+        btn_group = ttk.Frame(action_area)
+        btn_group.pack()
+        self.cut_btn = tk.Button(btn_group, text="✂ 裁剪", command=self.cut_video,
                                  width=20, font=('', 10),
                                  relief=tk.RAISED, bd=1, cursor='hand2', takefocus=False)
-        self.cut_btn.pack()
+        self.cut_btn.pack(side=tk.LEFT)
+        self.mode_arrow_btn = tk.Button(btn_group, text="▾", width=2, font=('', 10),
+                                        relief=tk.RAISED, bd=1, cursor='hand2',
+                                        takefocus=False, command=self._show_mode_menu)
+        self.mode_arrow_btn.pack(side=tk.LEFT)
+
+        # 截图格式选择行（仅截图模式显示）
+        self.fmt_row = ttk.Frame(action_area)
+        ttk.Radiobutton(self.fmt_row, text="PNG", variable=self.fmt_var,
+                        value='png', takefocus=False).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(self.fmt_row, text="JPG（质量 95）", variable=self.fmt_var,
+                        value='jpg', takefocus=False).pack(side=tk.LEFT, padx=2)
+
+        # 模式切换菜单
+        self.mode_menu = tk.Menu(self.root, tearoff=0)
+        self.mode_menu.add_radiobutton(label="✂ 裁剪", variable=self.mode_var,
+                                       value='cut', command=lambda: self._switch_mode('cut'))
+        self.mode_menu.add_radiobutton(label="📷 逐帧截图", variable=self.mode_var,
+                                       value='frames', command=lambda: self._switch_mode('frames'))
 
         # 状态栏
         self.status_var = tk.StringVar(value="就绪")
@@ -588,6 +615,25 @@ class VideoCutter:
         except Exception:
             return target_sec
 
+    def _show_mode_menu(self):
+        """在 ▾ 箭头下方弹出模式菜单"""
+        x = self.mode_arrow_btn.winfo_rootx()
+        y = self.mode_arrow_btn.winfo_rooty() + self.mode_arrow_btn.winfo_height()
+        try:
+            self.mode_menu.tk_popup(x, y)
+        finally:
+            self.mode_menu.grab_release()
+
+    def _switch_mode(self, mode):
+        """切换主按钮功能：'cut' 裁剪 / 'frames' 逐帧截图"""
+        self.action_mode = mode
+        if mode == 'cut':
+            self.cut_btn.configure(text="✂ 裁剪", command=self.cut_video)
+            self.fmt_row.pack_forget()
+        else:
+            self.cut_btn.configure(text="📷 逐帧截图", command=self.extract_frames)
+            self.fmt_row.pack()
+
     # ── 裁剪 ──────────────────────────────────────────────────
 
     def cut_video(self):
@@ -851,6 +897,181 @@ class VideoCutter:
             schedule(ui_finish, None, False, str(e))
         except Exception as e:
             schedule(ui_finish, None, False, str(e))
+
+    # ── 逐帧截图 ──────────────────────────────────────────────
+
+    def extract_frames(self):
+        """验证输入并启动逐帧截图：解析范围 → 模态进度窗 → 后台线程"""
+        if not self.video_path:
+            messagebox.showwarning("提示", "请先打开一个视频文件")
+            return
+        rng = self._resolve_frame_range(self.mark_in_frame, self.mark_out_frame,
+                                        self.total_frames)
+        if rng is None:
+            messagebox.showerror("错误", "起点必须在终点之前")
+            return
+        in_frame, out_frame = rng
+
+        # 位宽依据的总帧数：OpenCV 读不到时按时长×fps 估算
+        total_for_width = self.total_frames
+        if total_for_width < 2:
+            total_for_width = int(self.duration * self.fps) + 1
+
+        ext = self.fmt_var.get()
+        cmd, count, pattern = self._build_extract_cmd(
+            FFMPEG_PATH, self.video_path, in_frame, out_frame,
+            self.fps, total_for_width, ext=ext)
+
+        if self.is_playing:
+            self.is_playing = False
+            self.play_btn.configure(text="▶")
+
+        in_sec = in_frame / self.fps
+        out_sec = (out_frame + 1) / self.fps
+        out_dir = os.path.dirname(self.video_path)
+
+        # ── 弹出简化进度窗 ──
+        pw = tk.Toplevel(self.root)
+        pw.title("截图进度")
+        w, h = 460, 160
+        x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        pw.geometry(f"{w}x{h}+{x}+{y}")
+        pw.resizable(False, False)
+        pw.transient(self.root)
+        pw.grab_set()
+        pw.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        ttk.Label(pw, text=f"{self._fmt(in_sec)} → {self._fmt(out_sec)} · {count} 张",
+                  font=('', 10)).pack(pady=(12, 4))
+
+        bar_frame = ttk.Frame(pw)
+        bar_frame.pack(fill=tk.X, padx=12)
+        pbar = ttk.Progressbar(bar_frame, mode='determinate', length=400)
+        pbar.pack(side=tk.LEFT)
+        pct_lbl = ttk.Label(bar_frame, text="0%", width=5, anchor=tk.E)
+        pct_lbl.pack(side=tk.RIGHT)
+
+        live_lbl = ttk.Label(pw, text="", font=('', 9))
+        live_lbl.pack(pady=(4, 2))
+
+        btn_row = ttk.Frame(pw)
+        btn_row.pack(pady=(2, 8))
+        cancel_btn = ttk.Button(btn_row, text="中止", width=12)
+        cancel_btn.pack()
+        pw.update()
+
+        def ui_progress(done):
+            pct = min(done * 100 / count, 100.0) if count > 0 else 100.0
+            pbar['value'] = pct
+            pct_lbl.configure(text=f"{int(pct)}%")
+            if done > 0:
+                name = os.path.basename(pattern % (in_frame + done - 1))
+                live_lbl.configure(text=f"已输出 {done}/{count} 张（{name}）",
+                                   foreground='#666666')
+
+        def ui_finish(done=None, cancelled=False, error=None):
+            close_cmd = pw.destroy
+            if error:
+                live_lbl.configure(text="❌ 截图失败", foreground='#f44747')
+                messagebox.showerror("截图失败", error, parent=pw)
+            elif cancelled:
+                live_lbl.configure(text=f"⏹ 已中止，保留已输出 {done} 张",
+                                   foreground='#ffa500')
+            else:
+                def on_close():
+                    # 与裁剪一致：完成后关闭文件并复位主界面
+                    self._close_video()
+                    self.status_var.set(f"截图完成: {done} 张 → {out_dir}")
+                    pw.destroy()
+                close_cmd = on_close
+                live_lbl.configure(text=f"✅ 完成：{done} 张 → {out_dir}",
+                                   foreground='#2e8b57')
+                self.status_var.set(f"截图完成: {done} 张 → {out_dir}")
+            pw.grab_release()
+            pw.protocol("WM_DELETE_WINDOW", close_cmd)
+            cancel_btn.configure(state=tk.NORMAL, text="关闭", command=close_cmd)
+
+        self._cancel_requested = False
+
+        def on_cancel():
+            self._cancel_requested = True
+            cancel_btn.configure(state=tk.DISABLED, text="正在中止...")
+
+        cancel_btn.configure(command=on_cancel)
+
+        t = threading.Thread(target=self._extract_worker, args=(
+            cmd, count, ui_progress, ui_finish), daemon=True)
+        t.start()
+
+    def _extract_worker(self, cmd, count, ui_progress, ui_finish):
+        """后台线程：ffmpeg image2 逐帧截图，stderr frame= 行驱动进度"""
+        def schedule(fn, *args):
+            self.root.after(0, fn, *args)
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    creationflags=subprocess.CREATE_NO_WINDOW,
+                                    universal_newlines=True, errors='replace')
+            self._running_procs.append(proc)
+            err_tail = []
+            last_done = 0
+            try:
+                for line in iter(proc.stderr.readline, ''):
+                    if self._cancel_requested:
+                        proc.kill()
+                        proc.wait()
+                        break
+                    if line.startswith('frame='):
+                        m = re.search(r'frame=\s*(\d+)', line)
+                        if m:
+                            last_done = int(m.group(1))
+                            schedule(ui_progress, last_done)
+                    elif line.strip():
+                        err_tail.append(line)
+                        if len(err_tail) > 80:
+                            err_tail.pop(0)
+                proc.wait()
+            finally:
+                self._running_procs.remove(proc)
+
+            if self._cancel_requested:
+                schedule(ui_finish, last_done, True, None)
+            elif proc.returncode != 0:
+                schedule(ui_finish, None, False, ''.join(err_tail[-20:])[-400:])
+            else:
+                schedule(ui_finish, last_done, False, None)
+        except Exception as e:
+            schedule(ui_finish, None, False, str(e))
+
+    # ── 逐帧截图（纯函数） ────────────────────────────────────
+
+    @staticmethod
+    def _resolve_frame_range(mark_in_frame, mark_out_frame, total_frames):
+        """解析截图帧范围（双端包含）。未标记的端默认取视频首/末帧；
+        终点帧在起点帧之前返回 None，两端相等合法（单帧）"""
+        in_f = mark_in_frame if mark_in_frame is not None else 0
+        out_f = mark_out_frame if mark_out_frame is not None else total_frames - 1
+        if out_f < in_f:
+            return None
+        return in_f, out_f
+
+    @staticmethod
+    def _build_extract_cmd(ffmpeg_path, video_path, in_frame, out_frame,
+                           fps, total_frames, ext='png'):
+        """构造逐帧截图 ffmpeg 命令，返回 (cmd, count, pattern)
+        文件名编号＝帧号，位宽＝总帧数的位数（全序列等长）"""
+        count = out_frame - in_frame + 1
+        width = len(str(total_frames - 1)) if total_frames >= 2 else 6
+        in_sec = in_frame / fps
+        base, _ = os.path.splitext(video_path)
+        pattern = f"{base}_%0{width}d.{ext}"
+        cmd = [ffmpeg_path, "-y", "-ss", f"{in_sec:.6f}", "-i", video_path,
+               "-frames:v", str(count), "-start_number", str(in_frame)]
+        if ext.lower() in ('jpg', 'jpeg'):
+            cmd += ["-q:v", "2"]
+        cmd.append(pattern)
+        return cmd, count, pattern
 
     # ── 回收站 ──────────────────────────────────────────────
 
